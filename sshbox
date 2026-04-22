@@ -1,0 +1,469 @@
+#!/usr/bin/env python3
+
+from __future__ import annotations
+
+import json
+import os
+import shlex
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+
+CONFIG_DIR = Path.home() / ".config" / "sshbox"
+CONFIG_FILE = CONFIG_DIR / "servers.json"
+EXAMPLE_FILE = CONFIG_DIR / "servers.example.json"
+
+EXPECT_SCRIPT = r"""
+set timeout -1
+set password $env(SSHBOX_PASSWORD)
+set target $env(SSHBOX_TARGET)
+set port $env(SSHBOX_PORT)
+
+spawn ssh -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -p $port $target
+
+expect {
+    -regexp {Are you sure you want to continue connecting .*} {
+        send -- "yes\r"
+        exp_continue
+    }
+    -nocase -regexp {password:} {
+        send -- "$password\r"
+    }
+    eof
+}
+
+interact
+"""
+
+SCP_EXPECT_SCRIPT = r"""
+set timeout -1
+set password $env(SSHBOX_PASSWORD)
+set port $env(SSHBOX_PORT)
+set source $env(SSHBOX_SOURCE)
+set dest $env(SSHBOX_DEST)
+
+spawn scp -P $port -o ServerAliveInterval=30 -o ServerAliveCountMax=3 $source $dest
+
+expect {
+    -regexp {Are you sure you want to continue connecting .*} {
+        send -- "yes\r"
+        exp_continue
+    }
+    -nocase -regexp {password:} {
+        send -- "$password\r"
+        exp_continue
+    }
+    eof
+}
+
+catch wait result
+exit [lindex $result 3]
+"""
+
+FORWARD_EXPECT_SCRIPT = r"""
+set timeout -1
+set password $env(SSHBOX_PASSWORD)
+set target $env(SSHBOX_TARGET)
+set port $env(SSHBOX_PORT)
+set forward_spec $env(SSHBOX_FORWARD_SPEC)
+
+spawn ssh -o ExitOnForwardFailure=yes -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -N -L $forward_spec -p $port $target
+
+expect {
+    -regexp {Are you sure you want to continue connecting .*} {
+        send -- "yes\r"
+        exp_continue
+    }
+    -nocase -regexp {password:} {
+        send -- "$password\r"
+        exp_continue
+    }
+    eof
+}
+
+catch wait result
+exit [lindex $result 3]
+"""
+
+PUSH_SSH_PUB_EXPECT_SCRIPT = r"""
+set timeout -1
+set password $env(SSHBOX_PASSWORD)
+set target $env(SSHBOX_TARGET)
+set port $env(SSHBOX_PORT)
+set remote_command $env(SSHBOX_REMOTE_COMMAND)
+
+spawn ssh -o ServerAliveInterval=30 -o ServerAliveCountMax=3 -p $port $target $remote_command
+
+expect {
+    -regexp {Are you sure you want to continue connecting .*} {
+        send -- "yes\r"
+        exp_continue
+    }
+    -nocase -regexp {password:} {
+        send -- "$password\r"
+        exp_continue
+    }
+    eof
+}
+
+catch wait result
+exit [lindex $result 3]
+"""
+
+
+def fail(message: str, code: int = 1) -> None:
+    print(message, file=sys.stderr)
+    raise SystemExit(code)
+
+
+def ensure_config_files() -> None:
+    CONFIG_DIR.mkdir(parents=True, exist_ok=True)
+    if not CONFIG_FILE.exists():
+        CONFIG_FILE.write_text("[]\n", encoding="utf-8")
+        os.chmod(CONFIG_FILE, 0o600)
+    if not EXAMPLE_FILE.exists():
+        EXAMPLE_FILE.write_text(
+            json.dumps(
+                [
+                    {
+                        "name": "prod",
+                        "host": "192.168.1.10",
+                        "port": 22,
+                        "user": "root",
+                        "comment": "生产环境",
+                        "password": "replace-me",
+                    },
+                    {
+                        "name": "test",
+                        "host": "10.0.0.8",
+                        "port": 2222,
+                        "user": "ubuntu",
+                        "comment": "测试环境",
+                        "password": "replace-me-too",
+                    },
+                ],
+                ensure_ascii=False,
+                indent=2,
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        os.chmod(EXAMPLE_FILE, 0o600)
+
+
+def require_command(name: str, message: str) -> None:
+    if not shutil.which(name):
+        fail(message)
+
+
+def load_servers() -> list[dict]:
+    ensure_config_files()
+    try:
+        data = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        fail(f"配置文件不是合法 JSON: {CONFIG_FILE} ({exc})")
+    if not isinstance(data, list):
+        fail(f"配置文件格式错误，顶层必须是数组: {CONFIG_FILE}")
+    servers = []
+    for index, item in enumerate(data, start=1):
+        if not isinstance(item, dict):
+            fail(f"第 {index} 条配置不是对象")
+        name = str(item.get("name", "")).strip()
+        host = str(item.get("host", "")).strip()
+        user = str(item.get("user", "")).strip()
+        comment = str(item.get("comment", "")).strip()
+        password = str(item.get("password", ""))
+        port = item.get("port", 22)
+        try:
+            port = int(port)
+        except (TypeError, ValueError):
+            fail(f"{name or f'第 {index} 条'} 的 port 不是整数")
+        if not name or not host or not user or password == "":
+            fail(
+                f"{name or f'第 {index} 条'} 缺少必要字段，必须包含 name/host/user/password，port 可选"
+            )
+        servers.append(
+            {
+                "name": name,
+                "host": host,
+                "port": port,
+                "user": user,
+                "comment": comment,
+                "password": password,
+            }
+        )
+    return servers
+
+
+def print_usage() -> None:
+    print(
+        "\n".join(
+            [
+                "用法:",
+                "  sshbox list",
+                "  sshbox ocfg",
+                "  sshbox connect <name>",
+                "  sshbox put <name> <local_path> [remote_path]",
+                "  sshbox get <name> <remote_path> [local_path]",
+                "  sshbox forward <name> <local_port> <remote_port>",
+                "  sshbox forward <name> <local_port> <remote_host> <remote_port>",
+                "  sshbox push-ssh-pub <name> [pubkey_path]",
+                "  sshbox example",
+            ]
+        )
+    )
+
+
+def cmd_list() -> int:
+    servers = load_servers()
+    if not servers:
+        print(f"当前没有服务，编辑 {CONFIG_FILE} 后再试。")
+        return 0
+    name_width = max(len("NAME"), max(len(server["name"]) for server in servers))
+    user_width = max(len("USER"), max(len(server["user"]) for server in servers))
+    host_width = max(len("HOST"), max(len(server["host"]) for server in servers))
+    comment_width = max(
+        len("COMMENT"), max(len(server["comment"]) for server in servers)
+    )
+    print(
+        f"{'NAME':<{name_width}}  {'USER':<{user_width}}  {'HOST':<{host_width}}  "
+        f"PORT  {'COMMENT':<{comment_width}}"
+    )
+    for server in servers:
+        print(
+            f"{server['name']:<{name_width}}  {server['user']:<{user_width}}  "
+            f"{server['host']:<{host_width}}  {server['port']:<4}  "
+            f"{server['comment']:<{comment_width}}"
+        )
+    return 0
+
+
+def find_server(name: str) -> dict:
+    servers = load_servers()
+    for server in servers:
+        if server["name"] == name:
+            return server
+    available = ", ".join(server["name"] for server in servers) or "无"
+    fail(f"找不到服务 {name}。可用名称: {available}")
+
+
+def build_target(server: dict) -> str:
+    return f"{server['user']}@{server['host']}"
+
+
+def select_public_key_path(pubkey_path: str | None) -> Path:
+    if pubkey_path:
+        path = Path(pubkey_path).expanduser()
+        if not path.exists():
+            fail(f"公钥文件不存在: {path}")
+        if not path.is_file():
+            fail(f"公钥路径不是文件: {path}")
+        return path
+
+    candidates = [
+        Path.home() / ".ssh" / "id_ed25519.pub",
+        Path.home() / ".ssh" / "id_rsa.pub",
+    ]
+    for candidate in candidates:
+        if candidate.exists():
+            if not candidate.is_file():
+                fail(f"公钥路径不是文件: {candidate}")
+            return candidate
+
+    fail(
+        "未找到默认 SSH 公钥，已尝试: "
+        + ", ".join(str(candidate) for candidate in candidates)
+        + "。请传入 pubkey_path 或先生成密钥。"
+    )
+
+
+def load_public_key(pubkey_path: str | None) -> str:
+    path = select_public_key_path(pubkey_path)
+    try:
+        lines = [line.strip() for line in path.read_text(encoding="utf-8").splitlines()]
+    except UnicodeDecodeError:
+        fail(f"公钥文件不是有效 UTF-8 文本: {path}")
+
+    lines = [line for line in lines if line]
+    if not lines:
+        fail(f"公钥文件为空: {path}")
+    if len(lines) != 1:
+        fail(f"公钥文件格式错误，必须只包含一行 SSH 公钥: {path}")
+    return lines[0]
+
+
+def build_push_ssh_pub_remote_command(public_key: str) -> str:
+    quoted_key = shlex.quote(public_key)
+    return " && ".join(
+        [
+            "mkdir -p ~/.ssh",
+            "chmod 700 ~/.ssh",
+            "touch ~/.ssh/authorized_keys",
+            "chmod 600 ~/.ssh/authorized_keys",
+            f"pubkey={quoted_key}",
+            (
+                'if grep -Fqx -- "$pubkey" ~/.ssh/authorized_keys; then '
+                "printf '%s\\n' 'Public key already exists.'; "
+                "else "
+                "printf '%s\\n' \"$pubkey\" >> ~/.ssh/authorized_keys && "
+                "printf '%s\\n' 'Appended public key.'; "
+                "fi"
+            ),
+        ]
+    )
+
+
+def parse_port(value: str, field_name: str) -> int:
+    try:
+        port = int(value)
+    except (TypeError, ValueError):
+        fail(f"{field_name} 不是合法端口: {value}")
+    if port < 1 or port > 65535:
+        fail(f"{field_name} 超出范围: {port}")
+    return port
+
+
+def run_expect(script: str, server: dict, command: list[str], extra_env=None) -> int:
+    require_command("expect", "expect 未安装，当前脚本无法自动输入密码。")
+    env = os.environ.copy()
+    env["SSHBOX_PASSWORD"] = server["password"]
+    env["SSHBOX_TARGET"] = build_target(server)
+    env["SSHBOX_PORT"] = str(server["port"])
+    if extra_env:
+        env.update(extra_env)
+    return subprocess.run(command, env=env).returncode
+
+
+def cmd_connect(name: str) -> int:
+    server = find_server(name)
+    return run_expect(EXPECT_SCRIPT, server, ["expect", "-c", EXPECT_SCRIPT])
+
+
+def cmd_put(name: str, local_path: str, remote_path: str = ".") -> int:
+    server = find_server(name)
+    require_command("scp", "scp 未安装，无法上传文件。")
+    source = Path(local_path).expanduser()
+    if not source.exists():
+        fail(f"本地文件不存在: {source}")
+    return run_expect(
+        SCP_EXPECT_SCRIPT,
+        server,
+        ["expect", "-c", SCP_EXPECT_SCRIPT],
+        {
+            "SSHBOX_SOURCE": str(source),
+            "SSHBOX_DEST": f"{build_target(server)}:{remote_path}",
+        },
+    )
+
+
+def cmd_get(name: str, remote_path: str, local_path: str = ".") -> int:
+    server = find_server(name)
+    require_command("scp", "scp 未安装，无法下载文件。")
+    return run_expect(
+        SCP_EXPECT_SCRIPT,
+        server,
+        ["expect", "-c", SCP_EXPECT_SCRIPT],
+        {
+            "SSHBOX_SOURCE": f"{build_target(server)}:{remote_path}",
+            "SSHBOX_DEST": str(Path(local_path).expanduser()),
+        },
+    )
+
+
+def cmd_forward(name: str, local_port: str, remote_host: str, remote_port: str) -> int:
+    server = find_server(name)
+    local = parse_port(local_port, "本地端口")
+    remote = parse_port(remote_port, "远端端口")
+    return run_expect(
+        FORWARD_EXPECT_SCRIPT,
+        server,
+        ["expect", "-c", FORWARD_EXPECT_SCRIPT],
+        {
+            "SSHBOX_FORWARD_SPEC": f"{local}:{remote_host}:{remote}",
+        },
+    )
+
+
+def cmd_push_ssh_pub(name: str, pubkey_path: str | None = None) -> int:
+    server = find_server(name)
+    require_command("ssh", "ssh 未安装，无法推送公钥。")
+    public_key = load_public_key(pubkey_path)
+    remote_command = build_push_ssh_pub_remote_command(public_key)
+    return run_expect(
+        PUSH_SSH_PUB_EXPECT_SCRIPT,
+        server,
+        ["expect", "-c", PUSH_SSH_PUB_EXPECT_SCRIPT],
+        {
+            "SSHBOX_PUBKEY": public_key,
+            "SSHBOX_REMOTE_COMMAND": remote_command,
+        },
+    )
+
+
+def cmd_example() -> int:
+    ensure_config_files()
+    print(EXAMPLE_FILE)
+    return 0
+
+
+def cmd_ocfg() -> int:
+    ensure_config_files()
+    editor = os.environ.get("EDITOR", "").strip()
+    if editor:
+        command = shlex.split(editor) + [str(CONFIG_FILE)]
+    elif shutil.which("open"):
+        command = ["open", str(CONFIG_FILE)]
+    elif shutil.which("xdg-open"):
+        command = ["xdg-open", str(CONFIG_FILE)]
+    else:
+        fail(
+            f"未找到可用编辑器，请设置 EDITOR 环境变量后重试。配置文件路径: {CONFIG_FILE}"
+        )
+    return subprocess.run(command).returncode
+
+
+def main(argv: list[str]) -> int:
+    if len(argv) < 2 or argv[1] in {"-h", "--help", "help"}:
+        print_usage()
+        return 0
+    command = argv[1]
+    if command == "list":
+        return cmd_list()
+    if command == "ocfg":
+        if len(argv) != 2:
+            fail("用法: sshbox ocfg")
+        return cmd_ocfg()
+    if command == "connect":
+        if len(argv) != 3:
+            fail("请指定服务名称，例如: sshbox connect prod")
+        return cmd_connect(argv[2])
+    if command == "put":
+        if len(argv) not in {4, 5}:
+            fail("用法: sshbox put <name> <local_path> [remote_path]")
+        return cmd_put(argv[2], argv[3], argv[4] if len(argv) == 5 else ".")
+    if command == "get":
+        if len(argv) not in {4, 5}:
+            fail("用法: sshbox get <name> <remote_path> [local_path]")
+        return cmd_get(argv[2], argv[3], argv[4] if len(argv) == 5 else ".")
+    if command == "forward":
+        if len(argv) == 5:
+            return cmd_forward(argv[2], argv[3], "127.0.0.1", argv[4])
+        if len(argv) == 6:
+            return cmd_forward(argv[2], argv[3], argv[4], argv[5])
+        fail(
+            "用法: sshbox forward <name> <local_port> <remote_port>\n"
+            "      sshbox forward <name> <local_port> <remote_host> <remote_port>"
+        )
+    if command == "push-ssh-pub":
+        if len(argv) not in {3, 4}:
+            fail("用法: sshbox push-ssh-pub <name> [pubkey_path]")
+        return cmd_push_ssh_pub(argv[2], argv[3] if len(argv) == 4 else None)
+    if command == "example":
+        return cmd_example()
+    fail(f"未知命令: {command}")
+
+
+if __name__ == "__main__":
+    raise SystemExit(main(sys.argv))
