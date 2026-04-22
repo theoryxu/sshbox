@@ -7,6 +7,25 @@ from unittest import mock
 
 
 SSHBOX_PATH = Path(__file__).resolve().parents[1] / "sshbox"
+EXPECTED_SERVERS_TEMPLATE = """[
+  {
+    "name": "prod",
+    "host": "192.168.1.10",
+    "port": 22,
+    "user": "root",
+    "comment": "Production",
+    "password": "replace-me"
+  },
+  {
+    "name": "test",
+    "host": "10.0.0.8",
+    "port": 2222,
+    "user": "ubuntu",
+    "comment": "Testing",
+    "password": "replace-me-too"
+  }
+]
+"""
 
 
 def load_sshbox_module() -> ModuleType:
@@ -71,6 +90,31 @@ class UsageTests(unittest.TestCase):
 
         printed = "\n".join(call.args[0] for call in print_mock.call_args_list)
         self.assertIn("sshbox push-ssh-pub <name> [pubkey_path]", printed)
+
+
+class ConfigInitializationTests(unittest.TestCase):
+    def test_ensure_config_files_initializes_servers_json_with_example_template(self):
+        sshbox = load_sshbox_module()
+        with tempfile.TemporaryDirectory() as temp_dir:
+            config_dir = Path(temp_dir) / ".config" / "sshbox"
+            config_file = config_dir / "servers.json"
+            example_file = config_dir / "servers.example.json"
+
+            with (
+                mock.patch.object(sshbox, "CONFIG_DIR", config_dir),
+                mock.patch.object(sshbox, "CONFIG_FILE", config_file),
+                mock.patch.object(sshbox, "EXAMPLE_FILE", example_file),
+            ):
+                sshbox.ensure_config_files()
+
+            self.assertEqual(
+                config_file.read_text(encoding="utf-8"),
+                EXPECTED_SERVERS_TEMPLATE,
+            )
+            self.assertEqual(
+                example_file.read_text(encoding="utf-8"),
+                EXPECTED_SERVERS_TEMPLATE,
+            )
 
 
 class PushSshPubCommandTests(unittest.TestCase):

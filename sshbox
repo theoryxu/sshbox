@@ -14,6 +14,25 @@ from pathlib import Path
 CONFIG_DIR = Path.home() / ".config" / "sshbox"
 CONFIG_FILE = CONFIG_DIR / "servers.json"
 EXAMPLE_FILE = CONFIG_DIR / "servers.example.json"
+DEFAULT_SERVERS_TEMPLATE = """[
+  {
+    "name": "prod",
+    "host": "192.168.1.10",
+    "port": 22,
+    "user": "root",
+    "comment": "Production",
+    "password": "replace-me"
+  },
+  {
+    "name": "test",
+    "host": "10.0.0.8",
+    "port": 2222,
+    "user": "ubuntu",
+    "comment": "Testing",
+    "password": "replace-me-too"
+  }
+]
+"""
 
 EXPECT_SCRIPT = r"""
 set timeout -1
@@ -120,37 +139,12 @@ def fail(message: str, code: int = 1) -> None:
 
 def ensure_config_files() -> None:
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
-    if not CONFIG_FILE.exists():
-        CONFIG_FILE.write_text("[]\n", encoding="utf-8")
-        os.chmod(CONFIG_FILE, 0o600)
     if not EXAMPLE_FILE.exists():
-        EXAMPLE_FILE.write_text(
-            json.dumps(
-                [
-                    {
-                        "name": "prod",
-                        "host": "192.168.1.10",
-                        "port": 22,
-                        "user": "root",
-                        "comment": "生产环境",
-                        "password": "replace-me",
-                    },
-                    {
-                        "name": "test",
-                        "host": "10.0.0.8",
-                        "port": 2222,
-                        "user": "ubuntu",
-                        "comment": "测试环境",
-                        "password": "replace-me-too",
-                    },
-                ],
-                ensure_ascii=False,
-                indent=2,
-            )
-            + "\n",
-            encoding="utf-8",
-        )
+        EXAMPLE_FILE.write_text(DEFAULT_SERVERS_TEMPLATE, encoding="utf-8")
         os.chmod(EXAMPLE_FILE, 0o600)
+    if not CONFIG_FILE.exists():
+        CONFIG_FILE.write_text(EXAMPLE_FILE.read_text(encoding="utf-8"), encoding="utf-8")
+        os.chmod(CONFIG_FILE, 0o600)
 
 
 def require_command(name: str, message: str) -> None:

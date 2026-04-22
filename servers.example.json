@@ -1,0 +1,18 @@
+[
+  {
+    "name": "prod",
+    "host": "192.168.1.10",
+    "port": 22,
+    "user": "root",
+    "comment": "Production",
+    "password": "replace-me"
+  },
+  {
+    "name": "test",
+    "host": "10.0.0.8",
+    "port": 2222,
+    "user": "ubuntu",
+    "comment": "Testing",
+    "password": "replace-me-too"
+  }
+]
