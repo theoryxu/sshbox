@@ -49,8 +49,11 @@ expect {
     }
     -nocase -regexp {password:} {
         send -- "$password\r"
+        exp_continue
     }
-    eof
+    -re {[#\$%>] ?$} {}
+    timeout {}
+    eof { catch wait result; exit [lindex $result 3] }
 }
 
 interact
@@ -327,7 +330,14 @@ def run_expect(script: str, server: dict, command: list[str], extra_env=None) ->
     env["SSHBOX_PORT"] = str(server["port"])
     if extra_env:
         env.update(extra_env)
-    return subprocess.run(command, env=env).returncode
+    # Replace the Python process with expect so the child inherits the
+    # controlling terminal as the foreground process group. Using
+    # subprocess.run would leave Python as the foreground process, which
+    # swallows Ctrl+C (KeyboardInterrupt traceback) and in some terminals
+    # prevents keystrokes from reaching the interactive SSH session.
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os.execvpe(command[0], command, env)
 
 
 def cmd_connect(name: str) -> int:
